@@ -1,17 +1,23 @@
-// src/server.ts
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
+// ⭐ IMPORTANT: Increase body size limits BEFORE routes run
+app.use(cors());
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ limit: "20mb", extended: true }));
+
+// Initialize OpenAI client
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 });
 
+/* -------------------------------------------------------
+   ROUTE: Chat with book (text → text)
+------------------------------------------------------- */
 app.post("/api/grimoire/chat", async (req, res) => {
   try {
     const { bookTitle, author, history, question } = req.body as {
@@ -21,7 +27,6 @@ app.post("/api/grimoire/chat", async (req, res) => {
       question: string;
     };
 
-    // Build a simple conversation string for now
     const historyText =
       history && history.length
         ? history
@@ -36,10 +41,8 @@ app.post("/api/grimoire/chat", async (req, res) => {
 You are the manifested essence of the book "${bookTitle}"${
       author ? ` by ${author}` : ""
     }.
-
-Speak as if you are this book itself: wise, focused, and grounded in its themes and ideas.
-Keep answers concise but insightful. If you don't know something because the reader is asking
-outside the scope of the book, say so.
+Speak as this book itself. Reference themes, ideas, lessons.
+If the reader asks something outside the scope of the book, say so.
 
 Conversation so far:
 ${historyText}
@@ -48,22 +51,77 @@ Reader: ${question}
 Grimoire:`.trim();
 
     const response = await client.responses.create({
-      model: "gpt-4o-mini", // fast + cheap, supports text in/out :contentReference[oaicite:0]{index=0}
+      model: "gpt-4o", // Reliable text model
       input: prompt,
       temperature: 0.7,
     });
 
-    // JS SDK exposes a convenience field `output_text` with the full text. :contentReference[oaicite:1]{index=1}
-    const answer =
-      // @ts-ignore - typing for output_text is SDK-only
-      (response as any).output_text ??
-      // fallback: try to dig into output items if needed
-      "";
+    // @ts-ignore - output_text exists as a convenience field
+    const answer = response.output_text ?? "I'm not sure how to answer that.";
 
     res.json({ answer });
   } catch (err: any) {
-    console.error(err);
-    res.status(500).json({ error: "OpenAI error", detail: err?.message });
+    console.error("OpenAI chat error:", err?.response?.data ?? err);
+    res.status(500).json({
+      error: "chat_failed",
+      detail: err?.message ?? "unknown error",
+    });
+  }
+});
+
+/* -------------------------------------------------------
+   ROUTE: Identify book from image (image → JSON {title, author})
+------------------------------------------------------- */
+app.post("/api/grimoire/identify", async (req, res) => {
+  try {
+    const { imageBase64 } = req.body as { imageBase64?: string };
+
+    if (!imageBase64) {
+      return res.status(400).json({ error: "Missing imageBase64" });
+    }
+
+    const completion = await client.chat.completions.create({
+      model: "gpt-4o-mini", // Supports image input
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a book recognition assistant. When given a book cover image, identify the book title and author. Respond ONLY in valid JSON like: {\"title\": \"...\", \"author\": \"...\"}. If unsure, return null values.",
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Identify the book in this image. JSON only." },
+            {
+              type: "image_url",
+              image_url: {
+                url: `data:image/jpeg;base64,${imageBase64}`,
+              },
+            },
+          ],
+        },
+      ],
+    });
+
+    const raw = completion.choices[0]?.message?.content ?? "{}";
+
+    // Try to extract JSON object from the model output
+    const jsonMatch = raw.match(/\{[\s\S]*\}/);
+    let parsed: any = { title: null, author: null };
+    if (jsonMatch) {
+      parsed = JSON.parse(jsonMatch[0]);
+    }
+
+    res.json({
+      title: parsed.title ?? null,
+      author: parsed.author ?? null,
+    });
+  } catch (err: any) {
+    console.error("identify error:", err?.response?.data ?? err);
+    res.status(500).json({
+      error: "identify_failed",
+      detail: err?.message ?? "unknown error",
+    });
   }
 });
 

@@ -1,119 +1,179 @@
 // src/screens/CameraScreen.tsx
-import React, { useEffect, useState, useRef } from "react";
-import { View, Text, StyleSheet, TouchableOpacity, TextInput, Image } from "react-native";
-import { CameraView, useCameraPermissions } from "expo-camera";
+import React, {
+  useEffect,
+  useRef,
+  useState,
+  useCallback,
+} from "react";
+import { View, Text, StyleSheet, ActivityIndicator } from "react-native";
+import {
+  Camera,
+  useCameraDevice,
+  useCameraPermission,
+} from "react-native-vision-camera";
+import * as FileSystem from "expo-file-system";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { RootStackParamList } from "../types/navigation";
 import { createSessionForBook } from "@lib/sessionStore";
 import { Book } from "../types/book";
 import { nanoid } from "nanoid/non-secure";
+import { BACKEND_URL } from "@lib/config";
 
 type Props = NativeStackScreenProps<RootStackParamList, "Camera">;
 
 const CameraScreen: React.FC<Props> = ({ navigation }) => {
-  const [permission, requestPermission] = useCameraPermissions();
-  const cameraRef = useRef<React.ComponentRef<typeof CameraView>>(null);
-  const [capturedUri, setCapturedUri] = useState<string | null>(null);
-  const [titleInput, setTitleInput] = useState("");
-  const [authorInput, setAuthorInput] = useState("");
+  const device = useCameraDevice("back");
+  const { hasPermission, requestPermission } = useCameraPermission();
 
+  const [isScanning, setIsScanning] = useState(false);
+  const [locked, setLocked] = useState(false); // once we detect a book, lock to avoid double nav
+
+  const cameraRef = useRef<Camera | null>(null);
+  const scanTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Ask for camera permission
   useEffect(() => {
-    if (!permission) {
+    if (hasPermission == null) return;
+    if (!hasPermission) {
       requestPermission();
     }
-  }, [permission, requestPermission]);
+  }, [hasPermission, requestPermission]);
 
-  if (!permission) {
-    return (
-      <View style={styles.center}>
-        <Text>Requesting camera permission...</Text>
-      </View>
-    );
-  }
-
-  if (!permission.granted) {
-    return (
-      <View style={styles.center}>
-        <Text>No access to camera</Text>
-      </View>
-    );
-  }
-
-  const handleCapture = async () => {
+  const scanOnce = useCallback(async () => {
+    if (locked) return;
     if (!cameraRef.current) return;
-    const photo = await cameraRef.current.takePictureAsync();
-    setCapturedUri(photo.uri);
-  };
+    if (isScanning) return;
+    if (!device) return;
 
-  const handleStartChat = () => {
-    if (!titleInput.trim()) return;
+    try {
+      setIsScanning(true);
 
-    const book: Book = {
-      id: nanoid(),
-      title: titleInput.trim(),
-      author: authorInput.trim() || undefined,
-      coverImageUri: capturedUri ?? undefined,
+      // Take a quick photo for OCR
+      const photo = await cameraRef.current.takePhoto({
+        flash: "off",
+      });
+
+      // photo.path is something like "/var/mobile/Containers/Data/.../image.jpg"
+      const fileUri = `file://${photo.path}`;
+      const base64 = await FileSystem.readAsStringAsync(fileUri, {
+        encoding: "base64",
+      });
+
+      if (!base64) {
+        return;
+      }
+
+      const res = await fetch(`${BACKEND_URL}/api/grimoire/identify`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ imageBase64: base64 }),
+      });
+
+      if (!res.ok) {
+        console.warn("Identify error:", await res.text());
+        return;
+      }
+
+      const data = (await res.json()) as {
+        title: string | null;
+        author: string | null;
+      };
+
+      if (!data.title) {
+        // no confident detection yet; just let the loop continue
+        return;
+      }
+
+      // We have a title -> lock and navigate straight to chat
+      setLocked(true);
+      if (scanTimerRef.current) {
+        clearInterval(scanTimerRef.current);
+        scanTimerRef.current = null;
+      }
+
+      const book: Book = {
+        id: nanoid(),
+        title: data.title,
+        author: data.author ?? undefined,
+        coverImageUri: fileUri,
+      };
+
+      const session = createSessionForBook(book);
+      navigation.navigate("Chat", { bookId: session.id });
+    } catch (e) {
+      console.warn("Scan/identify failed", e);
+    } finally {
+      setIsScanning(false);
+    }
+  }, [locked, isScanning, device, navigation]);
+
+  // Start auto-scan loop when permission is granted and device is available
+  useEffect(() => {
+    if (!hasPermission || !device) return;
+
+    const startTimeout = setTimeout(() => {
+      if (scanTimerRef.current) return;
+      scanTimerRef.current = setInterval(() => {
+        void scanOnce();
+      }, 2500); // every 2.5s
+    }, 800);
+
+    return () => {
+      clearTimeout(startTimeout);
+      if (scanTimerRef.current) {
+        clearInterval(scanTimerRef.current);
+        scanTimerRef.current = null;
+      }
     };
+  }, [hasPermission, device, scanOnce]);
 
-    const session = createSessionForBook(book);
-    navigation.navigate("Chat", { bookId: session.id });
-  };
+  if (hasPermission == null || !device) {
+    return (
+      <View style={styles.center}>
+        <Text style={styles.text}>Preparing camera…</Text>
+      </View>
+    );
+  }
 
-  const handleRetake = () => {
-    setCapturedUri(null);
-    setTitleInput("");
-    setAuthorInput("");
-  };
+  if (!hasPermission) {
+    return (
+      <View style={styles.center}>
+        <Text style={styles.text}>No access to camera</Text>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>
-      {!capturedUri ? (
-        <>
-          <CameraView
-            ref={cameraRef}
-            style={styles.camera}
-            facing="back"
-          />
-          <View style={styles.bottomBar}>
-            <TouchableOpacity style={styles.captureButton} onPress={handleCapture}>
-              <Text style={styles.captureText}>Capture Book</Text>
-            </TouchableOpacity>
-          </View>
-        </>
-      ) : (
-        <View style={styles.confirmContainer}>
-          {capturedUri && (
-            <Image source={{ uri: capturedUri }} style={styles.previewImage} />
-          )}
-          <Text style={styles.label}>Book title</Text>
-          <TextInput
-            style={styles.input}
-            placeholder="e.g. Sapiens"
-            value={titleInput}
-            onChangeText={setTitleInput}
-          />
-          <Text style={styles.label}>Author (optional)</Text>
-          <TextInput
-            style={styles.input}
-            placeholder="e.g. Yuval Noah Harari"
-            value={authorInput}
-            onChangeText={setAuthorInput}
-          />
+      <Camera
+        ref={cameraRef}
+        style={styles.camera}
+        device={device}
+        isActive={!locked}      // stop preview once we’ve locked onto a book
+        photo={true}            // enable photo capture
+      />
 
-          <View style={styles.buttonRow}>
-            <TouchableOpacity style={[styles.smallButton, styles.secondary]} onPress={handleRetake}>
-              <Text>Retake</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.smallButton, titleInput ? styles.primary : styles.disabled]}
-              onPress={handleStartChat}
-              disabled={!titleInput}
-            >
-              <Text style={styles.primaryText}>Chat with this book</Text>
-            </TouchableOpacity>
-          </View>
+      <View style={styles.overlayBottom}>
+        <Text style={styles.title}>Summon a Grimoire</Text>
+        <Text style={styles.subtitle}>
+          Point your camera at a book. We’ll detect it and start the
+          conversation automatically.
+        </Text>
+        <View style={styles.statusRow}>
+          {isScanning && !locked ? (
+            <>
+              <ActivityIndicator size="small" />
+              <Text style={styles.statusText}>Scanning… hold steady</Text>
+            </>
+          ) : locked ? (
+            <Text style={styles.statusText}>Grimoire found — opening…</Text>
+          ) : (
+            <Text style={styles.statusText}>
+              Align the book cover or spine in the frame
+            </Text>
+          )}
         </View>
-      )}
+      </View>
     </View>
   );
 };
@@ -122,69 +182,42 @@ export default CameraScreen;
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#000" },
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
   camera: { flex: 1 },
-  bottomBar: {
-    padding: 16,
+  center: {
+    flex: 1,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "rgba(0,0,0,0.6)",
+    backgroundColor: "#000",
   },
-  captureButton: {
-    paddingVertical: 12,
-    paddingHorizontal: 24,
-    borderRadius: 999,
-    backgroundColor: "#fff",
+  text: { color: "#fff" },
+  overlayBottom: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    paddingHorizontal: 16,
+    paddingVertical: 20,
+    backgroundColor: "rgba(0,0,0,0.7)",
   },
-  captureText: {
+  title: {
+    color: "#fff",
     fontWeight: "600",
-  },
-  confirmContainer: {
-    flex: 1,
-    padding: 16,
-    backgroundColor: "#111",
-  },
-  previewImage: {
-    width: "100%",
-    height: 220,
-    borderRadius: 12,
-    marginBottom: 16,
-  },
-  label: {
-    color: "#eee",
+    fontSize: 18,
     marginBottom: 4,
-    marginTop: 8,
   },
-  input: {
-    borderWidth: 1,
-    borderColor: "#333",
-    borderRadius: 8,
-    padding: 10,
-    color: "#fff",
+  subtitle: {
+    color: "#ccc",
+    fontSize: 13,
+    marginBottom: 12,
   },
-  buttonRow: {
+  statusRow: {
     flexDirection: "row",
-    marginTop: 24,
-    justifyContent: "space-between",
-  },
-  smallButton: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 8,
     alignItems: "center",
-    marginHorizontal: 4,
+    gap: 8,
   },
-  primary: {
-    backgroundColor: "#4CAF50",
-  },
-  primaryText: {
-    color: "#fff",
-    fontWeight: "600",
-  },
-  secondary: {
-    backgroundColor: "#eee",
-  },
-  disabled: {
-    backgroundColor: "#555",
+  statusText: {
+    color: "#eee",
+    fontSize: 13,
+    marginLeft: 6,
   },
 });
