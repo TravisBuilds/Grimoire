@@ -1,215 +1,397 @@
 // src/screens/ChatScreen.tsx
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   View,
   Text,
   StyleSheet,
-  FlatList,
-  TextInput,
   TouchableOpacity,
-  KeyboardAvoidingView,
-  Platform,
-  Image,
+  FlatList,
 } from "react-native";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { RootStackParamList } from "../types/navigation";
+import { BACKEND_URL } from "@lib/config";
 import { getSession, appendMessage } from "@lib/sessionStore";
-import { BookSession, ChatMessage } from "../types/book";
-import { askBook } from "@lib/llm";
+import type { Book } from "../types/book";
+import { Audio } from "expo-av";
+import * as FileSystem from "expo-file-system/legacy";
 
 type Props = NativeStackScreenProps<RootStackParamList, "Chat">;
 
+type Turn = {
+  id: string;
+  role: "user" | "book";
+  content: string;
+};
+
+type PersonaGender = "male" | "female" | "unknown";
+
+type Persona = {
+  isFiction: boolean;
+  personaRole: "protagonist" | "author";
+  personaName: string;
+  gender: PersonaGender;
+};
+
 const ChatScreen: React.FC<Props> = ({ route, navigation }) => {
   const { bookId } = route.params;
-  const [session, setSession] = useState<BookSession | undefined>();
-  const [input, setInput] = useState("");
-  const [isSending, setIsSending] = useState(false);
 
+  const [book, setBook] = useState<Book | null>(null);
+  const [turns, setTurns] = useState<Turn[]>([]);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [recording, setRecording] = useState<Audio.Recording | null>(null);
+  const [currentGender, setCurrentGender] =
+    useState<PersonaGender>("unknown");
+
+  const [playingSound, setPlayingSound] = useState<Audio.Sound | null>(
+    null
+  );
+
+  // ---- Load session + book ----
   useEffect(() => {
-    const s = getSession(bookId);
-    if (!s) {
+    const session = getSession(bookId);
+    if (!session) {
+      console.warn("No session found for id", bookId);
       navigation.goBack();
       return;
     }
-    setSession(s);
-    navigation.setOptions({ title: s.book.title });
-  }, [bookId, navigation]);
 
-  const handleSend = async () => {
-    if (!session || !input.trim() || isSending) return;
-
-    const userText = input.trim();
-    setInput("");
-    setIsSending(true);
-
-    // 1) Add user message locally
-    const afterUser = appendMessage(session.id, {
-      role: "user",
-      content: userText,
+    setBook(session.book);
+    navigation.setOptions({
+      title: session.book.title || "Grimoire",
     });
 
-    if (afterUser) setSession(afterUser);
-
-    try {
-      // 2) Ask LLM
-      const reply = await askBook(afterUser ?? session, userText);
-
-      const afterBook = appendMessage(session.id, {
-        role: "book",
-        content: reply,
-      });
-      if (afterBook) setSession(afterBook);
-    } catch (e) {
-      const afterError = appendMessage(session.id, {
-        role: "book",
-        content:
-          "Sorry, something went wrong while trying to think about your question.",
-      });
-      if (afterError) setSession(afterError);
-    } finally {
-      setIsSending(false);
+    if (session.messages?.length) {
+      const mapped: Turn[] = session.messages.map((m: any) => ({
+        id: m.id,
+        role: m.role === "assistant" ? "book" : "user",
+        content: m.content,
+      }));
+      setTurns(mapped);
     }
-  };
+  }, [bookId, navigation]);
 
-  if (!session) {
+  // Cleanup playing sound when unmounting
+  useEffect(() => {
+    return () => {
+      if (playingSound) {
+        playingSound.unloadAsync().catch(() => {});
+      }
+    };
+  }, [playingSound]);
+
+  // ---- Helper: add turn ----
+  const addTurn = useCallback(
+    (turn: Turn) => {
+      setTurns((prev) => [...prev, turn]);
+      appendMessage(bookId, {
+        role: turn.role === "book" ? "book" : "user",
+        content: turn.content,
+      });
+    },
+    [bookId]
+  );
+
+  // ---- Recording logic ----
+  const startRecording = useCallback(async () => {
+    try {
+      if (!book) return;
+
+      console.log("🎙️ startRecording");
+      const perm = await Audio.requestPermissionsAsync();
+      if (!perm.granted) {
+        console.warn("Microphone permission not granted");
+        return;
+      }
+
+      await Audio.setAudioModeAsync({
+        allowsRecordingIOS: true,
+        playsInSilentModeIOS: true,
+      });
+
+      const { recording } = await Audio.Recording.createAsync(
+        Audio.RecordingOptionsPresets.HIGH_QUALITY
+      );
+
+      setRecording(recording);
+      setIsRecording(true);
+    } catch (err) {
+      console.error("startRecording error", err);
+    }
+  }, [book]);
+
+  const stopRecording = useCallback(async () => {
+    try {
+      if (!recording || !book) return;
+
+      console.log("🛑 stopRecording");
+      await recording.stopAndUnloadAsync();
+      const uri = recording.getURI();
+      setIsRecording(false);
+      setRecording(null);
+
+      if (!uri) {
+        console.warn("No URI from recording");
+        return;
+      }
+
+      const audioBase64 = await FileSystem.readAsStringAsync(uri, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      const history = turns.map((t) => ({
+        role: t.role === "book" ? "book" : "user",
+        content: t.content,
+      }));
+
+      setIsThinking(true);
+
+      const res = await fetch(`${BACKEND_URL}/api/grimoire/voice`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          audioBase64,
+          bookTitle: book.title,
+          author: book.author,
+          history,
+        }),
+      });
+
+      if (!res.ok) {
+        console.warn("voice route error", await res.text());
+        setIsThinking(false);
+        return;
+      }
+
+      const data = (await res.json()) as {
+        transcript: string;
+        answer: string;
+        persona?: Persona | null;
+        audioBase64?: string | null;
+        audioMimeType?: string | null;
+      };
+
+      console.log("VOICE result", data);
+
+      if (data.transcript) {
+        addTurn({
+          id: `u-${Date.now()}`,
+          role: "user",
+          content: data.transcript,
+        });
+      }
+
+      const answerTurn: Turn = {
+        id: `b-${Date.now()}`,
+        role: "book",
+        content: data.answer,
+      };
+      addTurn(answerTurn);
+
+      if (data.persona?.gender) {
+        setCurrentGender(data.persona.gender);
+      }
+
+      // ---- Play high-quality TTS audio if present ----
+      if (data.audioBase64) {
+        try {
+          const fileName = `grimoire-answer-${Date.now()}.mp3`;
+          const fileUri = `${FileSystem.cacheDirectory}${fileName}`;
+
+          await FileSystem.writeAsStringAsync(fileUri, data.audioBase64, {
+            encoding: FileSystem.EncodingType.Base64,
+          });
+
+          if (playingSound) {
+            await playingSound.unloadAsync();
+          }
+
+          const { sound } = await Audio.Sound.createAsync({ uri: fileUri });
+          setPlayingSound(sound);
+          await sound.playAsync();
+        } catch (e) {
+          console.warn("Failed to play TTS audio", e);
+        }
+      }
+
+      setIsThinking(false);
+    } catch (err) {
+      console.error("stopRecording/send error", err);
+      setIsThinking(false);
+      setIsRecording(false);
+      setRecording(null);
+    }
+  }, [recording, book, turns, addTurn, playingSound]);
+
+  const toggleRecording = useCallback(() => {
+    if (isRecording) {
+      void stopRecording();
+    } else {
+      void startRecording();
+    }
+  }, [isRecording, startRecording, stopRecording]);
+
+  if (!book) {
     return (
       <View style={styles.center}>
-        <Text>Loading session…</Text>
+        <Text style={styles.text}>Loading grimoire…</Text>
       </View>
     );
   }
 
-  const renderMessage = ({ item }: { item: ChatMessage }) => {
-    const isUser = item.role === "user";
-    return (
-      <View
-        style={[
-          styles.messageBubble,
-          isUser ? styles.messageUser : styles.messageBook,
-        ]}
-      >
-        <Text style={styles.messageText}>{item.content}</Text>
-      </View>
-    );
-  };
-
   return (
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.select({ ios: "padding", android: undefined })}
-      keyboardVerticalOffset={90}
-    >
-      <View style={styles.header}>
-        {session.book.coverImageUri ? (
-          <Image
-            source={{ uri: session.book.coverImageUri }}
-            style={styles.cover}
-          />
-        ) : null}
-        <View style={{ flex: 1 }}>
-          <Text style={styles.bookTitle}>{session.book.title}</Text>
-          {!!session.book.author && (
-            <Text style={styles.bookAuthor}>{session.book.author}</Text>
-          )}
-        </View>
-      </View>
-
+    <View style={styles.container}>
+      {/* Transcript log */}
       <FlatList
-        data={session.messages.sort((a, b) => a.createdAt - b.createdAt)}
+        data={turns}
         keyExtractor={(item) => item.id}
-        renderItem={renderMessage}
-        contentContainerStyle={styles.messagesList}
+        style={styles.list}
+        contentContainerStyle={styles.listContent}
+        renderItem={({ item }) => (
+          <View
+            style={[
+              styles.bubble,
+              item.role === "user" ? styles.bubbleUser : styles.bubbleBook,
+            ]}
+          >
+            <Text style={styles.bubbleLabel}>
+              {item.role === "user" ? "You" : book.title || "Grimoire"}
+            </Text>
+            <Text style={styles.bubbleText}>{item.content}</Text>
+          </View>
+        )}
       />
 
-      <View style={styles.inputRow}>
-        <TextInput
-          style={styles.input}
-          placeholder="Ask the book anything..."
-          placeholderTextColor="#888"
-          value={input}
-          onChangeText={setInput}
-          multiline
-        />
-        <TouchableOpacity
-          style={[styles.sendButton, (!input.trim() || isSending) && styles.sendDisabled]}
-          onPress={handleSend}
-          disabled={!input.trim() || isSending}
-        >
-          <Text style={styles.sendLabel}>{isSending ? "..." : "Send"}</Text>
-        </TouchableOpacity>
+      {/* Status + mic */}
+      <View style={styles.bottomBar}>
+        <Text style={styles.statusText}>
+          {isThinking
+            ? "Your grimoire is thinking…"
+            : isRecording
+            ? "Listening… tap again to send"
+            : "Tap to speak with your grimoire"}
+        </Text>
+
+        <View style={styles.actionsRow}>
+          <TouchableOpacity
+            onPress={() => navigation.navigate("Camera")}
+            style={styles.secondaryButton}
+          >
+            <Text style={styles.secondaryButtonText}>Scan another book</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity
+            onPress={toggleRecording}
+            style={[
+              styles.micButton,
+              isRecording ? styles.micButtonActive : null,
+            ]}
+          >
+            <Text style={styles.micText}>{isRecording ? "●" : "🎙️"}</Text>
+          </TouchableOpacity>
+        </View>
+
+        <Text style={styles.genderHint}>
+          Persona voice: {currentGender}
+        </Text>
       </View>
-    </KeyboardAvoidingView>
+    </View>
   );
 };
 
 export default ChatScreen;
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: "#050509" },
-  center: { flex: 1, alignItems: "center", justifyContent: "center" },
-  header: {
-    flexDirection: "row",
-    padding: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: "#222",
-    alignItems: "center",
-  },
-  cover: {
-    width: 48,
-    height: 72,
-    borderRadius: 4,
-    marginRight: 12,
-    backgroundColor: "#333",
-  },
-  bookTitle: { color: "#fff", fontWeight: "600", fontSize: 16 },
-  bookAuthor: { color: "#aaa", fontSize: 13, marginTop: 2 },
-  messagesList: {
-    padding: 12,
-    paddingBottom: 80,
-  },
-  messageBubble: {
-    maxWidth: "80%",
-    borderRadius: 16,
-    padding: 10,
-    marginVertical: 4,
-  },
-  messageUser: {
-    alignSelf: "flex-end",
-    backgroundColor: "#4CAF50",
-  },
-  messageBook: {
-    alignSelf: "flex-start",
-    backgroundColor: "#222",
-  },
-  messageText: { color: "#fff" },
-  inputRow: {
-    flexDirection: "row",
-    padding: 8,
-    borderTopWidth: 1,
-    borderTopColor: "#222",
-    backgroundColor: "#050509",
-  },
-  input: {
+  container: { flex: 1, backgroundColor: "#050510" },
+  center: {
     flex: 1,
-    minHeight: 40,
-    maxHeight: 120,
-    borderWidth: 1,
-    borderColor: "#333",
-    borderRadius: 16,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    color: "#fff",
-  },
-  sendButton: {
-    marginLeft: 8,
-    paddingHorizontal: 16,
-    borderRadius: 16,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "#4CAF50",
+    backgroundColor: "#050510",
   },
-  sendDisabled: {
-    backgroundColor: "#555",
+  text: { color: "#fff" },
+  list: { flex: 1 },
+  listContent: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
   },
-  sendLabel: { color: "#fff", fontWeight: "600" },
+  bubble: {
+    padding: 10,
+    borderRadius: 12,
+    marginBottom: 8,
+    maxWidth: "90%",
+  },
+  bubbleUser: {
+    alignSelf: "flex-end",
+    backgroundColor: "#2b6cb0",
+  },
+  bubbleBook: {
+    alignSelf: "flex-start",
+    backgroundColor: "#1a202c",
+  },
+  bubbleLabel: {
+    fontSize: 10,
+    fontWeight: "600",
+    color: "#cbd5f5",
+    marginBottom: 2,
+  },
+  bubbleText: {
+    color: "#f7fafc",
+    fontSize: 14,
+  },
+  bottomBar: {
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: "#2d3748",
+    alignItems: "center",
+  },
+  actionsRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    width: "100%",
+    gap: 12,
+    marginTop: 8,
+  },
+  secondaryButton: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "#4a5568",
+    backgroundColor: "#1a202c",
+  },
+  secondaryButtonText: {
+    color: "#cbd5f5",
+    textAlign: "center",
+    fontWeight: "600",
+  },
+  statusText: {
+    color: "#a0aec0",
+    marginBottom: 8,
+    fontSize: 13,
+  },
+  micButton: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#4a5568",
+    marginBottom: 4,
+  },
+  micButtonActive: {
+    backgroundColor: "#e53e3e",
+  },
+  micText: {
+    fontSize: 32,
+    color: "#f7fafc",
+  },
+  genderHint: {
+    color: "#718096",
+    fontSize: 11,
+    marginTop: 2,
+  },
 });

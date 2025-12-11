@@ -2,6 +2,9 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import OpenAI from "openai";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 const app = express();
 
@@ -12,6 +15,96 @@ app.use(express.urlencoded({ limit: "20mb", extended: true }));
 const client = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY!,
 });
+
+//helper types
+
+type PersonaRole = "protagonist" | "author";
+type PersonaGender = "male" | "female" | "unknown";
+
+type PersonaInfo = {
+  isFiction: boolean;
+  personaRole: PersonaRole;
+  personaName: string;
+  gender: PersonaGender;
+};
+
+const personaCache = new Map<string, PersonaInfo>();
+
+async function resolveBookPersona(
+  bookTitle: string,
+  author?: string
+): Promise<PersonaInfo> {
+  const key = `${bookTitle}|${author ?? ""}`.toLowerCase();
+  if (personaCache.has(key)) return personaCache.get(key)!;
+
+  const systemPrompt = `
+You classify books and choose a speaking persona.
+Given a book title (and optional author), determine:
+
+- Whether the book is fiction or non-fiction.
+- For fiction: who is the main protagonist (by name) and their gender (male/female/unknown).
+- For non-fiction: the persona should be the author of the book. Use the provided author name if available; otherwise infer it. Also provide gender if reasonably known, else "unknown".
+
+Respond ONLY as compact JSON in this exact shape:
+{
+  "isFiction": true | false,
+  "personaRole": "protagonist" | "author",
+  "personaName": "string",
+  "gender": "male" | "female" | "unknown"
+}
+`.trim();
+
+  const userText = `Book title: "${bookTitle}"${
+    author ? `\nAuthor: "${author}"` : ""
+  }`;
+
+  const completion = await client.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userText },
+    ],
+  });
+
+  let content = completion.choices[0]?.message?.content ?? "{}";
+  if (Array.isArray(content)) {
+    content = content.map((p: any) => p.text ?? "").join("\n");
+  }
+
+  let parsed: PersonaInfo = {
+    isFiction: true,
+    personaRole: "protagonist",
+    personaName: bookTitle,
+    gender: "unknown",
+  };
+
+  try {
+    const match = String(content).match(/\{[\s\S]*\}/);
+    if (match) {
+      parsed = JSON.parse(match[0]);
+    }
+  } catch (e) {
+    console.warn("Persona JSON parse failed, using default", e);
+  }
+
+  // Basic safety/defaults
+  if (parsed.personaRole !== "author" && parsed.personaRole !== "protagonist") {
+    parsed.personaRole = parsed.isFiction ? "protagonist" : "author";
+  }
+  if (!parsed.personaName) {
+    parsed.personaName =
+      parsed.personaRole === "protagonist"
+        ? bookTitle
+        : author || bookTitle;
+  }
+  if (!["male", "female", "unknown"].includes(parsed.gender)) {
+    parsed.gender = "unknown";
+  }
+
+  personaCache.set(key, parsed);
+  return parsed;
+}
+
 
 // Simple health check
 app.get("/health", (_req, res) => {
@@ -29,28 +122,38 @@ app.post("/api/grimoire/chat", async (req, res) => {
       question: string;
     };
 
+    const persona = await resolveBookPersona(bookTitle, author);
+
     const historyText =
       history && history.length
         ? history
             .map(
               (m) =>
-                `${m.role === "user" ? "Reader" : "Grimoire"}: ${m.content}`
+                `${m.role === "user" ? "Reader" : persona.personaName}: ${
+                  m.content
+                }`
             )
             .join("\n")
         : "";
 
+    const personaLine =
+      persona.personaRole === "protagonist"
+        ? `You are ${persona.personaName}, the main protagonist of the fiction book "${bookTitle}"${
+            author ? ` by ${author}` : ""
+          }. Speak in first person as ${persona.personaName}.`
+        : `You are ${persona.personaName}, the author of the non-fiction book "${bookTitle}"${
+            author ? ` by ${author}` : ""
+          }. Speak as the author, explaining and expanding on the ideas of the book.`;
+
     const prompt = `
-You are the manifested essence of the book "${bookTitle}"${
-      author ? ` by ${author}` : ""
-    }.
-Speak as this book itself. Reference its themes, ideas, and tone.
-If the reader asks something outside the scope of the book, say so.
+${personaLine}
+If the reader asks something outside the scope of the book, say so, but stay in character.
 
 Conversation so far:
 ${historyText}
 
 Reader: ${question}
-Grimoire:`.trim();
+${persona.personaName}:`.trim();
 
     const response = await client.responses.create({
       model: "gpt-4o",
@@ -61,7 +164,7 @@ Grimoire:`.trim();
     // @ts-ignore
     const answer = response.output_text ?? "I'm not sure how to answer that.";
 
-    res.json({ answer });
+    res.json({ answer, persona });
   } catch (err: any) {
     console.error("OpenAI chat error:", err?.response?.data ?? err);
     res.status(500).json({
@@ -70,6 +173,9 @@ Grimoire:`.trim();
     });
   }
 });
+
+
+
 
 /* ---------------- IDENTIFY ROUTE ---------------- */
 
@@ -156,6 +262,130 @@ app.post("/api/grimoire/identify", async (req, res) => {
       title: null,
       author: null,
       error: "identify_failed",
+      detail: err?.message ?? "unknown error",
+    });
+  }
+});
+
+app.post("/api/grimoire/voice", async (req, res) => {
+  try {
+    const {
+      audioBase64: inputAudioBase64,
+      bookTitle,
+      author,
+      history,
+    } = req.body as {
+      audioBase64: string;
+      bookTitle: string;
+      author?: string;
+      history?: { role: "user" | "book"; content: string }[];
+    };
+
+    if (!inputAudioBase64) {
+      return res.status(400).json({ error: "missing_audio" });
+    }
+
+    // 1) temp file
+    const buffer = Buffer.from(inputAudioBase64, "base64");
+    const tmpPath = path.join(os.tmpdir(), `grimoire-voice-${Date.now()}.m4a`);
+    await fs.promises.writeFile(tmpPath, buffer);
+
+    // 2) transcribe
+    const transcription = await client.audio.transcriptions.create({
+      model: "whisper-1",
+      file: fs.createReadStream(tmpPath),
+    });
+
+    const transcriptText = (transcription as any).text?.trim() ?? "";
+    fs.promises
+      .unlink(tmpPath)
+      .catch(() => {}); // cleanup best-effort
+
+    console.log("VOICE transcript:", transcriptText);
+
+    if (!transcriptText) {
+      return res.status(200).json({
+        transcript: "",
+        answer: "I couldn't quite hear that. Try asking again?",
+        persona: null,
+      });
+    }
+
+    // 3) persona resolution
+    const persona = await resolveBookPersona(bookTitle, author);
+
+    const historyText =
+      history && history.length
+        ? history
+            .map(
+              (m) =>
+                `${m.role === "user" ? "Reader" : persona.personaName}: ${
+                  m.content
+                }`
+            )
+            .join("\n")
+        : "";
+
+    const personaLine =
+      persona.personaRole === "protagonist"
+        ? `You are ${persona.personaName}, the main protagonist of the fiction book "${bookTitle}"${
+            author ? ` by ${author}` : ""
+          }. Speak in first person as ${persona.personaName}.`
+        : `You are ${persona.personaName}, the author of the non-fiction book "${bookTitle}"${
+            author ? ` by ${author}` : ""
+          }. Speak as the author, explaining and expanding on the ideas of the book.`;
+
+    const prompt = `
+${personaLine}
+If the reader asks something outside the scope of the book, say so, but stay in character.
+
+Conversation so far:
+${historyText}
+
+Reader: ${transcriptText}
+${persona.personaName}:`.trim();
+
+    const response = await client.responses.create({
+      model: "gpt-4o",
+      input: prompt,
+      temperature: 0.7,
+    });
+
+    // @ts-ignore
+    const answer: string =
+      (response as any).output_text ??
+      "I'm not sure how to answer that, but we can keep exploring together.";
+
+    console.log("VOICE answer:", answer, "persona:", persona);
+
+    // 5) Generate TTS audio with OpenAI if possible
+    let ttsAudioBase64: string | null = null;
+    let audioMimeType: string | null = null;
+    try {
+      const tts = await client.audio.speech.create({
+        model: "gpt-4o-mini-tts", // OpenAI TTS
+        voice: "alloy",
+        input: answer,
+      });
+
+      const audioBuffer = Buffer.from(await tts.arrayBuffer());
+      ttsAudioBase64 = audioBuffer.toString("base64");
+      audioMimeType = "audio/mpeg";
+    } catch (e) {
+      console.warn("TTS generation failed, falling back to text only", e);
+    }
+
+    return res.json({
+      transcript: transcriptText,
+      answer,
+      persona,
+      audioBase64: ttsAudioBase64,
+      audioMimeType,
+    });
+  } catch (err: any) {
+    console.error("VOICE route error:", err?.response?.data ?? err);
+    res.status(500).json({
+      error: "voice_failed",
       detail: err?.message ?? "unknown error",
     });
   }

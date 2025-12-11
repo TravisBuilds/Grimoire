@@ -38,7 +38,7 @@ const CameraScreen: React.FC<Props> = ({ navigation }) => {
   }, [hasPermission, requestPermission]);
 
   const scanOnce = useCallback(async () => {
-    console.log("BACKEND_URL in app:", BACKEND_URL);
+   
 
     if (locked) return;
     if (!cameraRef.current) return;

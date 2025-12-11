@@ -14,7 +14,7 @@ export function createSessionForBook(book: Book): BookSession {
         id: nanoid(),
         role: "book",
         createdAt: Date.now(),
-        content: `Hi, I'm "${book.title}". Ask me anything about my themes, ideas, or what I'm trying to teach.`,
+        content: `${book.title} has come to life! `,
       },
     ],
   };
