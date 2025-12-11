@@ -1,6 +1,6 @@
 # 📘 **Grimoire --- Project Specification**
 
-**Working Title:** *Grimoire*\
+**Title:** *Grimoire*\
 **Purpose:** An augmented reality app where users point their phone at
 any book---fiction, nonfiction, or textbook---and a "spirit" emerges
 from the book to speak with them as if the book itself were alive and
@@ -21,6 +21,33 @@ arguments, or exercises, - adapts tone and personality based on the
 book, - becomes smarter over time as it learns what the reader enjoys.
 
 ------------------------------------------------------------------------
+# BookChat Grimoire
+
+## Stack
+- React Native + Expo
+- TypeScript
+- Expo Router *or* React Navigation (we'll use React Navigation here)
+- Single source of truth for book sessions in a simple in-memory store (v0)
+
+## Architecture
+
+- `src/screens`:
+  - `CameraScreen.tsx` – camera + "Capture" flow
+  - `ChatScreen.tsx` – chat UI for a single book session
+
+- `src/lib`:
+  - `llm.ts` – wraps all calls to the LLM (OpenAI, etc.)
+
+- `src/types`:
+  - `book.ts` – shared types for Book, Message, BookSession
+
+## Rules
+
+- Use functional components with React Hooks.
+- All components and functions must be typed.
+- No business logic inside JSX; extract helpers where possible.
+- Keep LLM prompts centralized in `llm.ts`.
+
 
 # 🧰 **2. Tech Stack Overview**
 

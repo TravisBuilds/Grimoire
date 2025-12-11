@@ -11,7 +11,7 @@ import {
   useCameraDevice,
   useCameraPermission,
 } from "react-native-vision-camera";
-import * as FileSystem from "expo-file-system";
+import * as FileSystem from "expo-file-system/legacy";
 import { NativeStackScreenProps } from "@react-navigation/native-stack";
 import { RootStackParamList } from "../types/navigation";
 import { createSessionForBook } from "@lib/sessionStore";
@@ -26,7 +26,7 @@ const CameraScreen: React.FC<Props> = ({ navigation }) => {
   const { hasPermission, requestPermission } = useCameraPermission();
 
   const [isScanning, setIsScanning] = useState(false);
-  const [locked, setLocked] = useState(false); // once we detect a book, lock to avoid double nav
+  const [locked, setLocked] = useState(false);
 
   const cameraRef = useRef<Camera | null>(null);
   const scanTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -34,12 +34,12 @@ const CameraScreen: React.FC<Props> = ({ navigation }) => {
   // Ask for camera permission
   useEffect(() => {
     if (hasPermission == null) return;
-    if (!hasPermission) {
-      requestPermission();
-    }
+    if (!hasPermission) requestPermission();
   }, [hasPermission, requestPermission]);
 
   const scanOnce = useCallback(async () => {
+    console.log("BACKEND_URL in app:", BACKEND_URL);
+
     if (locked) return;
     if (!cameraRef.current) return;
     if (isScanning) return;
@@ -47,44 +47,75 @@ const CameraScreen: React.FC<Props> = ({ navigation }) => {
 
     try {
       setIsScanning(true);
+      console.log("🔁 scanOnce start");
 
-      // Take a quick photo for OCR
+      // 1) Quick internet sanity check
+      try {
+        const ping = await fetch("https://www.google.com", { method: "HEAD" });
+        console.log("🌐 Internet OK:", ping.status);
+      } catch (e) {
+        console.log("❌ No internet connection detected:", e);
+        return;
+      }
+
+      // 2) Capture a photo
       const photo = await cameraRef.current.takePhoto({
         flash: "off",
       });
 
-      // photo.path is something like "/var/mobile/Containers/Data/.../image.jpg"
       const fileUri = `file://${photo.path}`;
       const base64 = await FileSystem.readAsStringAsync(fileUri, {
-        encoding: "base64",
+        encoding: FileSystem.EncodingType.Base64,
       });
 
       if (!base64) {
+        console.log("⚠️ No base64 data from photo");
         return;
       }
 
-      const res = await fetch(`${BACKEND_URL}/api/grimoire/identify`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ imageBase64: base64 }),
-      });
-
-      if (!res.ok) {
-        console.warn("Identify error:", await res.text());
-        return;
-      }
-
-      const data = (await res.json()) as {
-        title: string | null;
-        author: string | null;
+      // 3) Call backend identify
+      let data: { title: string | null; author: string | null } = {
+        title: null,
+        author: null,
       };
 
-      if (!data.title) {
-        // no confident detection yet; just let the loop continue
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/grimoire/identify`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ imageBase64: base64 }),
+        });
+
+        console.log("🔍 Identify status:", res.status);
+
+        if (!res.ok) {
+          const text = await res.text();
+          console.warn("Identify HTTP error:", text);
+          // Even if identify fails, we’ll still fall back to a generic Grimoire below
+        } else {
+          data = (await res.json()) as {
+            title: string | null;
+            author: string | null;
+          };
+          console.log("🔍 Identify result:", data);
+        }
+      } catch (e) {
+        console.warn("Identify request failed:", e);
+        // Don't navigate if we can't identify the book
         return;
       }
 
-      // We have a title -> lock and navigate straight to chat
+      // 4) Only navigate if we successfully identified a book
+      if (!data.title) {
+        console.log("❌ No title identified, continuing scan…");
+        return;
+      }
+
+      const title = data.title;
+      const author = data.author ?? undefined;
+
+      console.log("✅ Locking and navigating with title:", title);
+
       setLocked(true);
       if (scanTimerRef.current) {
         clearInterval(scanTimerRef.current);
@@ -93,21 +124,21 @@ const CameraScreen: React.FC<Props> = ({ navigation }) => {
 
       const book: Book = {
         id: nanoid(),
-        title: data.title,
-        author: data.author ?? undefined,
+        title,
+        author,
         coverImageUri: fileUri,
       };
 
       const session = createSessionForBook(book);
       navigation.navigate("Chat", { bookId: session.id });
-    } catch (e) {
-      console.warn("Scan/identify failed", e);
+    } catch (err) {
+      console.warn("Scan/identify failed:", err);
     } finally {
       setIsScanning(false);
     }
   }, [locked, isScanning, device, navigation]);
 
-  // Start auto-scan loop when permission is granted and device is available
+  // Start auto-scan loop
   useEffect(() => {
     if (!hasPermission || !device) return;
 
@@ -115,7 +146,7 @@ const CameraScreen: React.FC<Props> = ({ navigation }) => {
       if (scanTimerRef.current) return;
       scanTimerRef.current = setInterval(() => {
         void scanOnce();
-      }, 2500); // every 2.5s
+      }, 3000); // every 3 seconds
     }, 800);
 
     return () => {
@@ -138,7 +169,7 @@ const CameraScreen: React.FC<Props> = ({ navigation }) => {
   if (!hasPermission) {
     return (
       <View style={styles.center}>
-        <Text style={styles.text}>No access to camera</Text>
+        <Text style={styles.text}>Camera permission required</Text>
       </View>
     );
   }
@@ -149,15 +180,14 @@ const CameraScreen: React.FC<Props> = ({ navigation }) => {
         ref={cameraRef}
         style={styles.camera}
         device={device}
-        isActive={!locked}      // stop preview once we’ve locked onto a book
-        photo={true}            // enable photo capture
+        isActive={!locked}
+        photo={true}
       />
 
       <View style={styles.overlayBottom}>
         <Text style={styles.title}>Summon a Grimoire</Text>
         <Text style={styles.subtitle}>
-          Point your camera at a book. We’ll detect it and start the
-          conversation automatically.
+          Point your camera at a book. Detection is automatic.
         </Text>
         <View style={styles.statusRow}>
           {isScanning && !locked ? (

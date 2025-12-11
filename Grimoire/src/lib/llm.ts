@@ -1,7 +1,8 @@
 // src/lib/llm.ts
 import { ChatMessage, BookSession } from "../types/book";
+import { BACKEND_URL } from "./config";
 
-const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || "http://192.168.86.95:4000";
+// const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || "http://192.168.86.95:4000";
 
 export async function askBook(
     session: BookSession,
