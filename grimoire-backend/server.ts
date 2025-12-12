@@ -5,6 +5,12 @@ import OpenAI from "openai";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { File as NodeFile } from "node:buffer";
+
+// Polyfill File global for OpenAI SDK (required for file uploads on Node < 20)
+if (typeof globalThis.File === "undefined") {
+  globalThis.File = NodeFile as any;
+}
 
 const app = express();
 
