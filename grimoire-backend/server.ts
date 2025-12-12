@@ -394,7 +394,8 @@ ${persona.personaName}:`.trim();
 /* ---------------- START SERVER ---------------- */
 
 const port = Number(process.env.PORT) || 4000;
+
 app.listen(port, "0.0.0.0", () => {
-  console.log(`Grimoire backend listening at http://0.0.0.0:${port}`);
-  console.log(`Accessible from network at http://192.168.86.112:${port}`);
+  console.log(`Grimoire backend listening on port ${port}`);
 });
+
