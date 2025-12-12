@@ -1,2 +1,2 @@
 // src/lib/config.ts
-export const BACKEND_URL = "http://192.168.86.112:4000";
+export const BACKEND_URL = "https://grimoire-production-6dcf.up.railway.app";
