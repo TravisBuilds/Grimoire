@@ -1,5 +1,7 @@
 // src/screens/ChatScreen.tsx
 import React, { useCallback, useEffect, useState } from "react";
+import { Pressable } from "react-native";
+
 import {
   View,
   Text,
@@ -49,27 +51,35 @@ const ChatScreen: React.FC<Props> = ({ route, navigation }) => {
 
   // ---- Load session + book ----
   useEffect(() => {
-    const session = getSession(bookId);
-    if (!session) {
-      console.warn("No session found for id", bookId);
-      navigation.goBack();
-      return;
-    }
-
-    setBook(session.book);
-    navigation.setOptions({
-      title: session.book.title || "Grimoire",
-    });
-
-    if (session.messages?.length) {
-      const mapped: Turn[] = session.messages.map((m: any) => ({
-        id: m.id,
-        role: m.role === "assistant" ? "book" : "user",
-        content: m.content,
-      }));
-      setTurns(mapped);
-    }
+    (async () => {
+      const session = await getSession(bookId);
+      if (!session) {
+        console.warn("No session found for id", bookId);
+        navigation.goBack();
+        return;
+      }
+  
+      setBook(session.book);
+      navigation.setOptions({
+        title: session.book.title || "Grimoire",
+        headerLeft: () => (
+          <Pressable onPress={() => navigation.navigate("Library")} style={{ paddingHorizontal: 12 }}>
+            <Text style={{ color: "#fff", fontSize: 16 }}>Library</Text>
+          </Pressable>
+        ),
+      });
+  
+      if (session.messages?.length) {
+        const mapped: Turn[] = session.messages.map((m: any) => ({
+          id: m.id,
+          role: (m.role === "assistant" ? "book" : "user") as "user" | "book",
+          content: m.content,
+        }));
+        setTurns(mapped);
+      }
+    })();
   }, [bookId, navigation]);
+  
 
   // Cleanup playing sound when unmounting
   useEffect(() => {
@@ -85,7 +95,7 @@ const ChatScreen: React.FC<Props> = ({ route, navigation }) => {
     (turn: Turn) => {
       setTurns((prev) => [...prev, turn]);
       appendMessage(bookId, {
-        role: turn.role === "book" ? "book" : "user",
+        role: turn.role === "book" ? "assistant" : "user",
         content: turn.content,
       });
     },

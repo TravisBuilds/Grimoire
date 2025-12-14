@@ -15,7 +15,8 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSCameraUsageDescription": "$(PRODUCT_NAME) needs access to your Camera."
+        "NSCameraUsageDescription": "$(PRODUCT_NAME) needs access to your Camera.",
+        "NSMicrophoneUsageDescription": "$(PRODUCT_NAME) needs access to your Microphone for voice chat."
       },
       "bundleIdentifier": "com.anonymous.Grimoire"
     },
@@ -45,6 +46,11 @@
           "microphonePermissionText": "$(PRODUCT_NAME) needs access to your Microphone for voice chat."
         }
       ]
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "032e4e25-c7a4-4b5d-8ca4-000a3aacc6b0"
+      }
+    }
   }
 }

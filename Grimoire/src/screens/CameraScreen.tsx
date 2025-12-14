@@ -129,7 +129,7 @@ const CameraScreen: React.FC<Props> = ({ navigation }) => {
         coverImageUri: fileUri,
       };
 
-      const session = createSessionForBook(book);
+      const session = await createSessionForBook(book);
       navigation.navigate("Chat", { bookId: session.id });
     } catch (err) {
       console.warn("Scan/identify failed:", err);
